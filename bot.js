@@ -4,113 +4,131 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 
-const BOT_TOKEN = '7565868655:AAGaELbwM3BtEPcjWRIR0aVL86t3qglb-YE'; // замени на свой
+// Конфигурация
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+if (!BOT_TOKEN) throw new Error('❌ TELEGRAM_BOT_TOKEN не задан!');
 const bot = new Telegraf(BOT_TOKEN);
 const videoPath = path.join(__dirname, 'temp_video.mp4');
 
-// Улучшенная обработка ошибок
+// Оптимизация для Puppeteer в облаке
+const PUPPETEER_OPTIONS = {
+    headless: 'new',
+    args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+        '--disable-gpu'
+    ],
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined
+};
+
+// Обработка ошибок
 process.on('unhandledRejection', (reason, promise) => {
     console.error('⚠️ Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
 process.on('uncaughtException', (error) => {
     console.error('⚠️ Uncaught Exception:', error);
+    process.exit(1);
 });
 
+// Очистка временных файлов
+function cleanup() {
+    try {
+        if (fs.existsSync(videoPath)) {
+            fs.unlinkSync(videoPath);
+        }
+    } catch (err) {
+        console.error('❌ Ошибка при очистке:', err);
+    }
+}
+
+// Основной обработчик
 bot.on('text', async (ctx) => {
-    const messageText = ctx.message.text;
-    const chatType = ctx.chat.type;
+    const { text, chat } = ctx.message;
+    const botUsername = ctx.botInfo.username;
 
-    const botUsername = ctx.botInfo?.username;
-    const isGroup = chatType === 'group' || chatType === 'supergroup';
-    const isDirectMention = messageText.includes(`@${botUsername}`);
-    const isCommand = messageText.startsWith('/reel');
+    // Проверка триггеров
+    const isGroup = ['group', 'supergroup'].includes(chat.type);
+    const isMentioned = text.includes(`@${botUsername}`);
+    const isCommand = text.startsWith('/reel');
 
-    if (isGroup && !(isCommand || isDirectMention)) return;
+    if (isGroup && !(isCommand || isMentioned)) return;
 
-    const urlMatch = messageText.match(/https?:\/\/(www\.)?instagram\.com\/reel\/[^\s]+/);
-    if (!urlMatch) return ctx.reply('Пожалуйста, пришлите ссылку на Reels (Instagram)');
+    // Валидация URL
+    const urlMatch = text.match(/https?:\/\/(www\.)?instagram\.com\/(reel|p)\/[^\s]+/i);
+    if (!urlMatch) return ctx.reply('🔗 Пришлите ссылку на Instagram Reel или Post');
 
     const url = urlMatch[0];
-    await ctx.reply('⏳ Обрабатываю ссылку...');
+    await ctx.replyWithChatAction('upload_video');
 
     try {
-        const browser = await puppeteer.launch({
-            headless: 'new',
-            args: ['--no-sandbox', '--disable-setuid-sandbox'],
-        });
+        // Загрузка видео
+        await ctx.reply('⏳ Скачиваю видео...');
+        const browser = await puppeteer.launch(PUPPETEER_OPTIONS);
         const page = await browser.newPage();
-        await page.goto('https://snapins.ai/', { waitUntil: 'domcontentloaded' });
+
+        await page.goto('https://snapins.ai/', {
+            waitUntil: 'networkidle2',
+            timeout: 30000
+        });
 
         await page.type('input[name="url"]', url);
         await page.click('button[type="submit"]');
 
-        const downloadButton = await page.waitForSelector('[download]', { timeout: 60000 });
-        if (!downloadButton) throw new Error('Кнопка скачивания не найдена');
-
-        const videoUrl = await page.$eval('[download]', (el) => el.href);
+        // Ожидание загрузки
+        await page.waitForSelector('[download]', { timeout: 60000 });
+        const videoUrl = await page.$eval('[download]', el => el.href);
         await browser.close();
 
+        // Скачивание и отправка
         const file = fs.createWriteStream(videoPath);
-        https.get(videoUrl, (response) => {
-            response.pipe(file);
-            file.on('finish', async () => {
-                try {
-                    await ctx.replyWithVideo(
-                        { source: videoPath },
-                        {
-                            caption: 'Вот ваше видео!',
-                            supports_streaming: true,
-                        }
-                    );
-                } catch (sendError) {
-                    console.error('❌ Ошибка отправки видео:', sendError);
-                    await ctx.reply('❌ Не удалось отправить видео. Попробуйте позже.');
-                }
-                try {
-                    fs.unlinkSync(videoPath);
-                } catch (unlinkError) {
-                    console.error('❌ Ошибка удаления файла:', unlinkError);
-                }
-            });
+        await new Promise((resolve, reject) => {
+            https.get(videoUrl, response => {
+                response.pipe(file);
+                file.on('finish', resolve);
+                file.on('error', reject);
+            }).on('error', reject);
         });
+
+        await ctx.replyWithVideo(
+            { source: fs.createReadStream(videoPath) },
+            {
+                caption: '🎥 Ваше видео готово!',
+                supports_streaming: true
+            }
+        );
+
     } catch (err) {
         console.error('❌ Ошибка:', err);
-        await ctx.reply('❌ Не удалось скачать видео. Попробуйте другую ссылку.');
+        await ctx.reply('⚠️ Не удалось обработать видео. Попробуйте другую ссылку.');
+    } finally {
+        cleanup();
     }
 });
 
-async function initBot() {
+// Управление жизненным циклом
+(async () => {
     try {
-        console.log('🔄 Запуск бота...');
-        const botInfo = await bot.telegram.getMe();
-        bot.options.username = botInfo.username;
-        console.log(`ℹ️ Информация о боте получена: @${botInfo.username}`);
-
         await bot.launch();
-        console.log(`✅ Бот @${botInfo.username} успешно запущен!`);
-
-        // Вывод информации о вебхуке (если используется)
-        if (bot.options.telegram.webhookReply) {
-            console.log('🌍 Режим работы: Webhook');
-        } else {
-            console.log('🔄 Режим работы: Long Polling');
-        }
+        console.log('🤖 Бот успешно запущен!');
+        console.log('⚡ Режим работы:', bot.options.telegram.webhookReply ? 'Webhook' : 'Long Polling');
     } catch (err) {
-        console.error('❌ Критическая ошибка запуска бота:', err);
-        process.exit(1); // Завершаем процесс с ошибкой
+        console.error('❌ Фатальная ошибка:', err);
+        process.exit(1);
     }
-}
+})();
 
-// Запускаем бота и обрабатываем завершение
-initBot().then(() => {
-    // Обработка сигналов завершения
-    process.once('SIGINT', () => {
-        console.log('\n🛑 Получен SIGINT. Остановка бота...');
-        bot.stop('SIGINT');
-    });
-    process.once('SIGTERM', () => {
-        console.log('\n🛑 Получен SIGTERM. Остановка бота...');
-        bot.stop('SIGTERM');
+// Graceful shutdown
+['SIGINT', 'SIGTERM'].forEach(signal => {
+    process.once(signal, () => {
+        console.log(`🛑 Получен ${signal}. Остановка бота...`);
+        bot.stop(signal);
+        cleanup();
+        process.exit(0);
     });
 });
